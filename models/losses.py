@@ -15,19 +15,36 @@ def s(x, epsilon=1e-30):
         x + 1
     )
 
-
 def log_stablemax(x, dim=-1):
-    s_x = s(x)
-    return torch.log(s_x/torch.sum(s_x, dim=dim, keepdim=True))
+    # Ensure we handle the dtype properly
+    original_dtype = x.dtype
+    if x.device.type == 'mps' and x.dtype == torch.float64:
+        x = x.to(torch.float32)
 
+    s_x = s(x)
+    result = torch.log(s_x / torch.sum(s_x, dim=dim, keepdim=True))
+
+    # Convert back to original dtype if possible
+    if x.device.type != 'mps' and original_dtype == torch.float64:
+        result = result.to(original_dtype)
+
+    return result
 
 def stablemax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask=None):
-    logprobs = log_stablemax(logits.to(torch.float64), dim=-1)
+    # Detect device type and use appropriate dtype
+    if logits.device.type == 'mps':
+        # MPS doesn't support float64, use float32
+        logprobs = log_stablemax(logits.to(torch.float32), dim=-1)
+    else:
+        # CUDA and CPU support float64
+        logprobs = log_stablemax(logits.to(torch.float64), dim=-1)
 
     if valid_mask is None:
-        valid_mask = (labels != ignore_index)
+        valid_mask = labels != ignore_index
     transformed_labels = torch.where(valid_mask, labels, 0)
-    prediction_logprobs = torch.gather(logprobs, index=transformed_labels.to(torch.long).unsqueeze(-1), dim=-1).squeeze(-1)
+    prediction_logprobs = torch.gather(
+        logprobs, index=transformed_labels.to(torch.long).unsqueeze(-1), dim=-1
+    ).squeeze(-1)
 
     return -torch.where(valid_mask, prediction_logprobs, 0)
 
@@ -65,6 +82,7 @@ class ACTLossHead(nn.Module):
             # Correctness
             mask = (labels != IGNORE_LABEL_ID)
             loss_counts = mask.sum(-1)
+            # print(f"{loss_counts=}")
             loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # Avoid NaNs in division
 
             is_correct = mask & (torch.argmax(outputs["logits"], dim=-1) == labels)
@@ -72,6 +90,7 @@ class ACTLossHead(nn.Module):
             
             # Metrics (halted)
             valid_metrics = new_carry.halted & (loss_counts > 0)
+            # print(f"{valid_metrics.sum()=} {new_carry.halted=}")
             metrics = {
                 "count": valid_metrics.sum(),
                 
@@ -99,5 +118,6 @@ class ACTLossHead(nn.Module):
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
+        # print(f"checking {metrics=}")
         return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
 

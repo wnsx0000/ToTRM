@@ -1,0 +1,58 @@
+[project]
+name = "official-trm"
+version = "0.1.0"
+description = "An implementation of TRM"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "Samsung SAIL", email = "alexia.j@samsung.com" }
+]
+license = "MIT"  # Changed to simple string to fix the warning
+
+dependencies = [
+    "argdantic>=0.4.0",
+    "coolname>=2.0.0",
+    "einops>=0.7.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "scikit-learn>=1.3.0",
+    "pandas>=2.0.0",
+    "matplotlib>=3.7.0",
+    "seaborn>=0.12.0",
+    "tqdm>=4.65.0",
+    "colorama>=0.4.6",
+    "Pillow>=10.0.0",
+    "omegaconf>=2.3.0",
+    "lightning>=2.5.4",
+    "wandb>=0.21.1",
+    "hydra-core>=1.3.2",
+    "hydra-colorlog>=1.2.0",
+    "rich>=14.1.0",
+    "transformers>=4.56.0",
+    "taskipy>=1.12.0",
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "einops>=0.7.0",
+    "timm>=0.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.5.0",
+    "ipython>=8.14.0",
+    "jupyter>=1.0.0",
+    "notebook>=7.0.0",
+    "ipywidgets>=8.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["data", "kaggle", "config", "models", "assets", "dataset", "evaluators"]
+exclude = ["tests*", "docs*"]

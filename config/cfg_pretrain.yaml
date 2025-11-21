@@ -15,7 +15,7 @@ evaluators:
   - name: arc@ARC
 
 # Hyperparams - Training
-global_batch_size: 768
+global_batch_size: 8 # 768
 
 epochs: 100000
 eval_interval: 10000
@@ -40,3 +40,4 @@ min_eval_interval: 0 # when to start the eval
 ema: False # use Exponential-Moving-Average
 ema_rate: 0.999 # EMA-rate
 freeze_weights: False # If True, freeze weights and only learn the embeddings
+use_wandb: true
