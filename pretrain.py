@@ -417,6 +417,12 @@ def evaluate(
 ):
     reduced_metrics = None
 
+    if rank == 0:
+        print(f"\n{'='*70}")
+        print(f"[EVAL] Starting evaluation at step {train_state.step}")
+
+    eval_start_time = time.time()
+
     with torch.inference_mode():
         return_keys = set(config.eval_save_outputs)
         for evaluator in evaluators:
@@ -433,11 +439,21 @@ def evaluate(
 
         carry = None
         processed_batches = 0
+        # Calculate actual number of batches based on puzzles and batch size
+        estimated_batches = (eval_metadata.total_puzzles + config.global_batch_size - 1) // config.global_batch_size
         
+        if rank == 0:
+            print(f"[EVAL] Processing ~{estimated_batches:,} batches ({eval_metadata.total_puzzles:,} puzzles)")
+
         for set_name, batch, global_batch_size in eval_loader:
             processed_batches += 1
-            # if rank == 0:
-            #     print(f"Processing batch {processed_batches}: {set_name}")
+
+            if rank == 0 and processed_batches % 10 == 0:
+                progress_pct = (processed_batches / estimated_batches) * 100 if estimated_batches > 0 else 0
+                elapsed_time = time.time() - eval_start_time
+                elapsed_min = int(elapsed_time // 60)
+                elapsed_sec = int(elapsed_time % 60)
+                print(f"[EVAL] Batch {processed_batches:,}/{estimated_batches:,} ({progress_pct:.1f}%) - Elapsed: {elapsed_min}m {elapsed_sec}s")
             
             # To device
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -462,7 +478,8 @@ def evaluate(
                 for k, v in collection.items():
                     if k in config.eval_save_outputs:
                         save_preds.setdefault(k, [])
-                        save_preds[k].append(v.cpu())  # Move to CPU for saving GPU memory
+                        # save_preds[k].append(v.cpu())  # Move to CPU for saving GPU memory
+                        save_preds[k].append(v.detach()) # Keep on GPU, only move to CPU when saving
 
             for evaluator in evaluators:
                 evaluator.update_batch(batch, preds)
@@ -491,9 +508,13 @@ def evaluate(
         if config.checkpoint_path is not None and len(save_preds):
             # Each rank save predictions independently
             os.makedirs(os.path.dirname(config.checkpoint_path), exist_ok=True)
+            # Move to CPU for saving
+            save_preds_cpu = {k: v.cpu() for k, v in save_preds.items()}
             torch.save(
-                save_preds, os.path.join(config.checkpoint_path, f"step_{train_state.step}_all_preds.{rank}")
+                # save_preds, os.path.join(config.checkpoint_path, f"step_{train_state.step}_all_preds.{rank}")
+                save_preds_cpu, os.path.join(config.checkpoint_path, f"step_{train_state.step}_all_preds.{rank}")
             )
+            del save_preds_cpu
 
         del save_preds
 
@@ -545,6 +566,14 @@ def evaluate(
                 
         # if rank == 0:
         #     print("All evaluators completed!")
+
+    if rank == 0:
+        total_eval_time = time.time() - eval_start_time
+        eval_min = int(total_eval_time // 60)
+        eval_sec = int(total_eval_time % 60)
+        print(f"[EVAL] Completed evaluation at step {train_state.step}")
+        print(f"[EVAL] Total time: {eval_min}m {eval_sec}s ({total_eval_time:.1f}s)")
+        print(f"{'='*70}\n")
 
     return reduced_metrics
 

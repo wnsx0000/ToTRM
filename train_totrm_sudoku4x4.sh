@@ -26,4 +26,4 @@ DISABLE_COMPILE=1 uv run python pretrain.py \
     lr_warmup_steps=0 \
     eval_interval=100 \
     +entity="jhunforspeed-soongsil-univ" \
-    +project_name="totrm"
+    +project_name="totrm-sudoku4x4" \
