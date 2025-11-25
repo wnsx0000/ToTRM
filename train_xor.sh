@@ -28,4 +28,3 @@ uv run python pretrain.py \
     lr_warmup_steps=0 \
     eval_interval=1 \
     +run_name=xor_small_stable
-
