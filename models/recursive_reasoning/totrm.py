@@ -242,11 +242,23 @@ class ToTRM_Inner(nn.Module):
         
         # Get branch embeddings: [B*W*2, D]
         branch_embs = self.branch_embeddings[branch_indices]
-        
-        # Add to first position (puzzle embedding position)
-        # This injects branch-specific information into the sequence
-        z_branched[:, 0, :] = z_branched[:, 0, :] + branch_embs
-        
+
+        # # DEBUG: Print shapes before and after unsqueeze
+        # if current_tree_width == 1:  # Only print on first branching
+        #     print(f"[DEBUG BRANCHING]")
+        #     print(f"  z_branched.shape (before adding) = {z_branched.shape}")
+        #     print(f"  branch_embs.shape = {branch_embs.shape}")
+        #     branch_embs_unsqueezed = branch_embs.unsqueeze(1)
+        #     print(f"  branch_embs.unsqueeze(1).shape = {branch_embs_unsqueezed.shape}")
+        #     print(f"  Broadcasting: [{z_branched.shape[0]}, {z_branched.shape[1]}, {z_branched.shape[2]}]")
+        #     print(f"              + [{branch_embs_unsqueezed.shape[0]}, {branch_embs_unsqueezed.shape[1]}, {branch_embs_unsqueezed.shape[2]}]")
+        #     print(f"  -> Same branch_emb vector added to ALL {z_branched.shape[1]} positions")
+
+        # Add to all positions in the sequence
+        # This injects branch-specific information into all tokens
+        # unsqueeze(1) -> [B*W*2, 1, D] for broadcasting over seq_len
+        z_branched = z_branched + branch_embs.unsqueeze(1)
+
         return z_branched
 
     def _merge_tree(self, z: torch.Tensor, tree_width: int, original_batch_size: int) -> torch.Tensor:
@@ -311,9 +323,17 @@ class ToTRM_Inner(nn.Module):
         )
 
         original_batch_size = batch["inputs"].shape[0]
-        
+
+        # # DEBUG: Print batch inputs shape
+        # print(f"[DEBUG] batch['inputs'].shape = {batch['inputs'].shape}")
+        # print(f"        Meaning: [batch_size, seq_len] where seq_len = num_cells")
+
         # Input encoding
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+
+        # # DEBUG: Print input embeddings shape
+        # print(f"[DEBUG] input_embeddings.shape = {input_embeddings.shape}")
+        # print(f"        Meaning: [batch_size, puzzle_emb_len + seq_len, hidden_size]")
 
         # Initialize tree
         z_H, z_L = carry.z_H, carry.z_L
@@ -330,12 +350,23 @@ class ToTRM_Inner(nn.Module):
                     
                     # Update z_L
                     z_L = self.L_level(z_L, expanded_z_H + expanded_input, **seq_info)
-                    
+
+                    # # DEBUG: Print z_L shape (only on first iteration to avoid spam)
+                    # if _H_step == 0 and _L_step == 0:
+                    #     print(f"[DEBUG] z_L.shape = {z_L.shape}")
+                    #     print(f"        Meaning: [batch_size * tree_width, puzzle_emb_len + seq_len, hidden_size]")
+                    #     print(f"        Current: batch_size={original_batch_size}, tree_width={current_tree_width}")
+
                     # Branch if this is a branching step
                     if _L_step < self.config.tree_branching_steps:
                         z_L = self._branch_state(z_L, current_tree_width)
                         current_tree_width *= 2
-                
+
+                        # # DEBUG: Print z_L shape after branching (only on first H-cycle, first few L-steps)
+                        # if _H_step == 0 and _L_step < 3:
+                        #     print(f"[DEBUG] After branching L_step={_L_step}: z_L.shape = {z_L.shape}")
+                        #     print(f"        tree_width doubled: {current_tree_width // 2} -> {current_tree_width}")
+
                 # Merge tree before updating z_H
                 z_L_merged = self._merge_tree(z_L, current_tree_width, original_batch_size)
                 z_H = self.L_level(z_H, z_L_merged, **seq_info)
@@ -358,11 +389,33 @@ class ToTRM_Inner(nn.Module):
         z_L_merged = self._merge_tree(z_L, current_tree_width, original_batch_size)
         z_H = self.L_level(z_H, z_L_merged, **seq_info)
 
+        # # DEBUG: Print final z_H shape
+        # print(f"[DEBUG] Final z_H.shape = {z_H.shape}")
+        # print(f"        Meaning: [batch_size, puzzle_emb_len + seq_len, hidden_size]")
+
         # LM Outputs
         new_carry = ToTRM_InnerCarry(z_H=z_H.detach(), z_L=z_H.clone().detach(), tree_width=1)
-        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
-        q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
-        
+
+        # Main output: predict next token for each position
+        lm_output_full = self.lm_head(z_H)  # [batch, 97, vocab_size]
+        output = lm_output_full[:, self.puzzle_emb_len:]  # [batch, 81, vocab_size]
+
+        # # DEBUG: Print output shapes
+        # print(f"[DEBUG] self.lm_head(z_H).shape = {lm_output_full.shape}")
+        # print(f"        Meaning: [batch_size, puzzle_emb_len + seq_len, vocab_size]")
+        # print(f"[DEBUG] output.shape = {output.shape}")
+        # print(f"        Meaning: [batch_size, seq_len, vocab_size] (puzzle positions removed)")
+
+        # Q-head: predict halt/continue from position 0
+        z_H_pos0 = z_H[:, 0]  # [batch, hidden_size]
+        q_logits = self.q_head(z_H_pos0).to(torch.float32)  # [batch, 2]
+
+        # # DEBUG: Print q_logits shape
+        # print(f"[DEBUG] z_H[:, 0].shape = {z_H_pos0.shape}")
+        # print(f"        Meaning: [batch_size, hidden_size] (position 0 only)")
+        # print(f"[DEBUG] q_logits.shape = {q_logits.shape}")
+        # print(f"        Meaning: [batch_size, 2] (Q-values: [halt, continue])")
+
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
 
