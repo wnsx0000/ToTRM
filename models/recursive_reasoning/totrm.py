@@ -178,9 +178,17 @@ class ToTRM_Inner(nn.Module):
         # Tree merge layer (for combining branches)
         if self.config.tree_merge_method == "learned_weighted":
             # Learn weights for each position in the tree
+            # Initialize with small random values so all branches start with similar importance
+            # but can diverge during training
             max_tree_width = 2 ** self.config.tree_branching_steps
             self.merge_weights = nn.Parameter(
-                torch.ones(max_tree_width, dtype=self.forward_dtype) / max_tree_width
+                torch.randn(max_tree_width, dtype=self.forward_dtype) * 0.01
+            )
+        elif self.config.tree_merge_method == "gated_product":
+            # Learnable gate to interpolate between geometric mean (product) and arithmetic mean (sum)
+            # Initialize to -2.0 so sigmoid(-2.0) ≈ 0.12 → starts closer to mean for stability
+            self.product_gate = nn.Parameter(
+                torch.tensor(-2.0, dtype=self.forward_dtype)
             )
         
         # Branch embeddings to differentiate branches at each level
@@ -237,11 +245,15 @@ class ToTRM_Inner(nn.Module):
         new_tree_width = current_tree_width * 2
         
         # Create branch indices: [0, 1, 0, 1, 0, 1, ...] for the entire batch
-        branch_pattern = torch.arange(new_tree_width, device=z.device) % 2
+        branch_pattern = torch.arange(new_tree_width, device=z.device)
+        # max_tree_width = 2 ** self.config.tree_branching_steps
+        # branch_pattern = torch.randint(0, max_tree_width, (new_tree_width,), device=z.device)
         branch_indices = branch_pattern.repeat(batch_size)
         
         # Get branch embeddings: [B*W*2, D]
-        branch_embs = self.branch_embeddings[branch_indices]
+        # branch_embs = self.branch_embeddings[branch_indices]
+        branch_norm_factor = 0.5
+        branch_embs = F.normalize(self.branch_embeddings[branch_indices], dim=-1) * branch_norm_factor
 
         # # DEBUG: Print shapes before and after unsqueeze
         # if current_tree_width == 1:  # Only print on first branching
@@ -254,19 +266,29 @@ class ToTRM_Inner(nn.Module):
         #     print(f"              + [{branch_embs_unsqueezed.shape[0]}, {branch_embs_unsqueezed.shape[1]}, {branch_embs_unsqueezed.shape[2]}]")
         #     print(f"  -> Same branch_emb vector added to ALL {z_branched.shape[1]} positions")
 
-        # Add to all positions in the sequence
-        # This injects branch-specific information into all tokens
-        # unsqueeze(1) -> [B*W*2, 1, D] for broadcasting over seq_len
+        # # branch embeddings 이전에 먼저 normalize
+        # z_branched_norm = F.layer_norm(z_branched, (z_branched.shape[-1],))
+
+        # 더하기
+        # z_branched = z_branched_norm + branch_embs.unsqueeze(1)
         z_branched = z_branched + branch_embs.unsqueeze(1)
+
+        # # branch embeddings 더한 후에 normalize
+        # z_branched = F.layer_norm(z_branched, (z_branched.shape[-1],))
 
         return z_branched
 
     def _merge_tree(self, z: torch.Tensor, tree_width: int, original_batch_size: int) -> torch.Tensor:
         """Merge the tree of states back into a single state per batch item.
-        
+
+        Different merge strategies:
+        - mean: Simple average (all branches equally weighted)
+        - max: Take max activation (keeps strongest signal)
+        - learned_weighted: Learn importance weights for each branch position
+
         Args:
             z: [batch_size * tree_width, seq_len, hidden_size]
-            tree_width: Number of branches
+            tree_width: Number of branches (2^n where n = tree_branching_steps)
             original_batch_size: Original batch size before branching
         Returns:
             z: [batch_size, seq_len, hidden_size]
@@ -274,22 +296,76 @@ class ToTRM_Inner(nn.Module):
         # Reshape to separate tree dimension
         # [batch_size * tree_width, seq_len, hidden_size] -> [batch_size, tree_width, seq_len, hidden_size]
         z = z.view(original_batch_size, tree_width, *z.shape[1:])
-        
+
         if self.config.tree_merge_method == "mean":
             # Average across tree branches
+            # Pro: Simple, stable
+            # Con: Wrong branches can dilute correct ones
             z = z.mean(dim=1)
         elif self.config.tree_merge_method == "max":
             # Max pooling across tree branches
+            # Pro: Keeps strongest signal, ignores weak branches
+            # Con: Only one branch contributes, others wasted
             z = z.max(dim=1)[0]
         elif self.config.tree_merge_method == "learned_weighted":
-            # Weighted sum with learned weights
-            weights = F.softmax(self.merge_weights[:tree_width], dim=0)
-            # weights: [tree_width] -> [1, tree_width, 1, 1]
+            # Weighted sum with learned weights per branch position
+            # Pro: Model learns which branch positions are more reliable
+            # Con: Same weights used for all batch items (position-based, not content-based)
+
+            # Apply softmax to get normalized weights that sum to 1
+            # This ensures merge is a proper weighted average
+            weights = F.softmax(self.merge_weights[:tree_width], dim=0)  # [tree_width]
+
+            # Reshape for broadcasting: [tree_width] -> [1, tree_width, 1, 1]
+            # This allows element-wise multiplication with z of shape [B, W, L, D]
             weights = weights.view(1, tree_width, 1, 1)
-            z = (z * weights).sum(dim=1)
+
+            # Weighted sum: each branch weighted by its learned importance
+            # Higher weight = model learned this branch position is more useful
+            z = (z * weights).sum(dim=1)  # [B, L, D]
+        elif self.config.tree_merge_method == "geometric_mean":
+            # Pure geometric mean: (x1 * x2 * ... * xn)^(1/n)
+            # Pro: All branches must "agree" for strong signal (consensus)
+            # Pro: Less sensitive to outliers than arithmetic mean
+            # Con: Can be unstable if values cross zero frequently
+
+            # Use log-space for numerical stability: exp(mean(log(|x|)))
+            eps = 1e-8
+            z_abs = torch.abs(z) + eps
+            log_abs = torch.log(z_abs)
+            geom_mean_abs = torch.exp(log_abs.mean(dim=1))  # [B, L, D]
+
+            # Sign handling: use sign of arithmetic sum (simple and stable)
+            z_sign = torch.sign(z.sum(dim=1))
+            z = geom_mean_abs * z_sign
+        elif self.config.tree_merge_method == "gated_product":
+            # Interpolate between geometric mean (product) and arithmetic mean (sum)
+            # Pro: Combines consensus mechanism (product) with stability (mean)
+            # Pro: Model learns optimal balance during training
+            # Con: More complex computation
+
+            # Learnable gate: 0 = pure mean, 1 = pure geometric mean
+            alpha = torch.sigmoid(self.product_gate)
+
+            # Arithmetic mean (stable baseline)
+            arith_mean = z.mean(dim=1)  # [B, L, D]
+
+            # Geometric mean (consensus mechanism)
+            # Use log-space for numerical stability
+            eps = 1e-8
+            z_abs = torch.abs(z) + eps
+            log_abs = torch.log(z_abs)
+            geom_mean_abs = torch.exp(log_abs.mean(dim=1))  # [B, L, D]
+
+            # Sign handling: use sign of arithmetic sum (simple and stable)
+            z_sign = torch.sign(z.sum(dim=1))
+            geom_mean = geom_mean_abs * z_sign
+
+            # Interpolate: α * geom_mean + (1-α) * arith_mean
+            z = alpha * geom_mean + (1 - alpha) * arith_mean
         else:
             raise ValueError(f"Unknown merge method: {self.config.tree_merge_method}")
-        
+
         return z
 
     def _expand_input_for_tree(self, input_embeddings: torch.Tensor, tree_width: int) -> torch.Tensor:

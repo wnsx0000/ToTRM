@@ -5,7 +5,7 @@ DISABLE_COMPILE=1 uv run python pretrain.py \
     data_paths="[data/sudoku-extreme-1k-aug-1000-eval-10pct]" \
     evaluators="[]" \
     epochs=10000 \
-    eval_interval=500 \
+    eval_interval=1000 \
     lr=1e-4 \
     puzzle_emb_lr=1e-4 \
     weight_decay=1.0 \
@@ -27,7 +27,7 @@ DISABLE_COMPILE=1 uv run python pretrain.py \
     lr_warmup_steps=0 \
     +entity="jhunforspeed-soongsil-univ" \
     +project_name="totrm-sudoku-extreme" \
-    +load_checkpoint="/home/wnsx0000/jhun/ToTRM/checkpoints/totrm-sudoku-extreme/totrm_251125/step_78120" \
+    +load_checkpoint="/home/wnsx0000/jhun/ToTRM/checkpoints/totrm-sudoku-extreme/totrm_251125_2/step_15624" \
     
     # TRM에서의 값
     # arch=totrm \
