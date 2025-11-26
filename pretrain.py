@@ -8,10 +8,12 @@ import copy
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader
 from utils.checkpoint_utils import CheckpointManager
 import time
+import numpy as np
 
 import tqdm
 import wandb
@@ -156,6 +158,35 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                 for param in list(model.parameters()) + list(model.buffers()):
                     dist.broadcast(param, src=0)
 
+    # Freeze weights for transfer learning
+    if config.freeze_weights:
+        print("\n[Freeze Weights Mode - Transfer Learning]")
+        # Freeze all parameters first
+        for name, param in model.named_parameters():
+            param.requires_grad = False
+            print(f"  Frozen: {name}")
+
+        # Unfreeze ToTRM-specific parameters (if they exist)
+        totrm_params_to_train = []
+        if hasattr(model.model, 'inner') and hasattr(model.model.inner, 'branch_embeddings'):
+            model.model.inner.branch_embeddings.requires_grad = True
+            totrm_params_to_train.append('branch_embeddings')
+            print(f"  Unfrozen: branch_embeddings (shape: {model.model.inner.branch_embeddings.shape})")
+
+        if hasattr(model.model, 'inner') and hasattr(model.model.inner, 'merge_weights'):
+            model.model.inner.merge_weights.requires_grad = True
+            totrm_params_to_train.append('merge_weights')
+            print(f"  Unfrozen: merge_weights (shape: {model.model.inner.merge_weights.shape})")
+
+        if hasattr(model.model, 'inner') and hasattr(model.model.inner, 'product_gate'):
+            model.model.inner.product_gate.requires_grad = True
+            totrm_params_to_train.append('product_gate')
+            print(f"  Unfrozen: product_gate")
+
+        if totrm_params_to_train:
+            print(f"\nToTRM-specific parameters to train: {totrm_params_to_train}")
+        print()
+
     # Optimizers and lr
     if config.arch.puzzle_emb_ndim == 0:
         try:
@@ -178,17 +209,56 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
             config.lr
         ]
     elif config.freeze_weights:
-        optimizers = [
-            CastedSparseEmbeddingSignSGD_Distributed(
-                model.model.puzzle_emb.buffers(),  # type: ignore
-                lr=0,  # Needs to be set by scheduler
-                weight_decay=config.puzzle_emb_weight_decay,
-                world_size=world_size
-            )
-        ]
-        optimizer_lrs = [
-            config.puzzle_emb_lr
-        ]
+        # Transfer learning mode: only train ToTRM-specific parameters + puzzle_emb
+        # Collect trainable parameters (ToTRM-specific: branch_embeddings, merge_weights, product_gate)
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+
+        if len(trainable_params) > 0:
+            # Use AdamW for ToTRM-specific parameters (branch_embeddings, etc.)
+            try:
+                totrm_optimizer = AdamATan2(
+                    trainable_params,
+                    lr=0,  # Needs to be set by scheduler
+                    weight_decay=config.weight_decay,
+                    betas=(config.beta1, config.beta2)
+                )
+            except NameError:
+                totrm_optimizer = torch.optim.AdamW(
+                    trainable_params,
+                    lr=0,  # Needs to be set by scheduler
+                    weight_decay=config.weight_decay,
+                    betas=(config.beta1, config.beta2)
+                )
+
+            # Also train puzzle embeddings
+            optimizers = [
+                CastedSparseEmbeddingSignSGD_Distributed(
+                    model.model.puzzle_emb.buffers(),  # type: ignore
+                    lr=0,  # Needs to be set by scheduler
+                    weight_decay=config.puzzle_emb_weight_decay,
+                    world_size=world_size
+                ),
+                totrm_optimizer
+            ]
+            optimizer_lrs = [
+                config.puzzle_emb_lr,
+                config.lr  # Use same LR as main training for ToTRM params
+            ]
+            print(f"[Transfer Learning] Training {len(trainable_params)} ToTRM-specific parameters + puzzle_emb")
+        else:
+            # Only puzzle embeddings (no ToTRM-specific params)
+            optimizers = [
+                CastedSparseEmbeddingSignSGD_Distributed(
+                    model.model.puzzle_emb.buffers(),  # type: ignore
+                    lr=0,  # Needs to be set by scheduler
+                    weight_decay=config.puzzle_emb_weight_decay,
+                    world_size=world_size
+                )
+            ]
+            optimizer_lrs = [
+                config.puzzle_emb_lr
+            ]
+            print(f"[Transfer Learning] Training only puzzle_emb")
     else:
         try:
             optimizer = AdamATan2(
@@ -277,8 +347,27 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig, device: str = "cud
         # Load state dict
         state_dict = torch.load(config.load_checkpoint, map_location=device)
 
+        # Handle _orig_mod prefix from torch.compile
+        # Need to match checkpoint keys with current model keys
+        checkpoint_has_prefix = any(k.startswith("_orig_mod.") for k in state_dict.keys())
+        model_has_prefix = any(k.startswith("_orig_mod.") for k in model.state_dict().keys())
+
+        if checkpoint_has_prefix and not model_has_prefix:
+            # Checkpoint from compiled model, current model not compiled
+            print("Removing _orig_mod prefix from checkpoint (checkpoint compiled, current model not compiled)")
+            state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+        elif not checkpoint_has_prefix and model_has_prefix:
+            # Checkpoint from non-compiled model, current model compiled
+            print("Adding _orig_mod prefix to checkpoint (checkpoint not compiled, current model compiled)")
+            state_dict = {"_orig_mod." + k: v for k, v in state_dict.items()}
+        elif checkpoint_has_prefix and model_has_prefix:
+            print("Both checkpoint and model are compiled (no prefix adjustment needed)")
+        else:
+            print("Neither checkpoint nor model are compiled (no prefix adjustment needed)")
+
         # Resize and reset puzzle emb if needed
-        puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"
+        # Use the correct key name based on whether model is compiled
+        puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights" if model_has_prefix else "model.inner.puzzle_emb.weights"
         expected_shape: torch.Size = model.model.puzzle_emb.weights.shape  # type: ignore
         if puzzle_emb_name in state_dict:
             puzzle_emb = state_dict[puzzle_emb_name]
@@ -288,7 +377,23 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig, device: str = "cud
                 state_dict[puzzle_emb_name] = (
                     torch.mean(puzzle_emb, dim=0, keepdim=True).expand(expected_shape).contiguous()
                 )
-        model.load_state_dict(state_dict, assign=True)
+
+        # For transfer learning (e.g., TRM -> ToTRM), allow missing keys
+        # ToTRM-specific weights (branch_embeddings, merge_weights, etc.) will be randomly initialized
+        strict = not config.freeze_weights  # If freeze_weights=True, we're likely doing transfer learning
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=strict, assign=True)
+
+        if not strict:
+            print(f"\n[Transfer Learning Mode]")
+            if missing_keys:
+                print(f"Missing keys (will be randomly initialized):")
+                for key in missing_keys:
+                    print(f"  - {key}")
+            if unexpected_keys:
+                print(f"Unexpected keys (ignored):")
+                for key in unexpected_keys:
+                    print(f"  - {key}")
+            print()
 
 
 def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
@@ -404,6 +509,134 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             reduced_metrics["train/lr"] = lr_this_step
             return reduced_metrics
 
+
+def compute_totrm_branch_metrics(model, eval_loader, device, num_samples=5):
+    """
+    Compute ToTRM branch diversity metrics on a few evaluation samples.
+
+    Returns:
+        dict with keys:
+            - z_L_branch_similarity_mean: mean cosine similarity between z_L branches (off-diagonal)
+            - z_L_branch_similarity_std: std of cosine similarity between z_L branches
+            - z_L_z_H_similarity_mean: mean cosine similarity between each z_L and final z_H
+            - z_L_z_H_similarity_std: std of cosine similarity between each z_L and final z_H
+    """
+    # print(f"[DEBUG compute_totrm_branch_metrics] Model type: {type(model).__name__}")
+    # print(f"[DEBUG compute_totrm_branch_metrics] Has inner: {hasattr(model, 'inner')}")
+
+    model.eval()
+    inner_model = model.inner
+
+    # print(f"[DEBUG compute_totrm_branch_metrics] Inner model type: {type(inner_model).__name__}")
+    # print(f"[DEBUG compute_totrm_branch_metrics] Tree branching steps: {inner_model.config.tree_branching_steps}")
+
+    all_z_L_sims = []
+    all_z_L_z_H_sims = []
+
+    with torch.no_grad():
+        sample_count = 0
+        for set_name, batch, global_batch_size in eval_loader:
+            if sample_count >= num_samples:
+                break
+
+            batch = {k: v.to(device) for k, v in batch.items()}
+            batch_size = batch["inputs"].shape[0]
+
+            # print(f"[DEBUG] Processing sample {sample_count}, batch_size={batch_size}")
+
+            # Prepare inputs
+            seq_info = dict(
+                cos_sin=inner_model.rotary_emb() if hasattr(inner_model, "rotary_emb") else None,
+            )
+            input_embeddings = inner_model._input_embeddings(
+                batch["inputs"], batch["puzzle_identifiers"]
+            )
+
+            # Initialize carry properly with H_init and L_init
+            carry = inner_model.empty_carry(batch_size)
+            # Manually initialize with H_init and L_init (ensure correct device)
+            z_H = inner_model.H_init.to(device).unsqueeze(0).unsqueeze(0).expand(
+                batch_size, carry.z_H.shape[1], -1
+            ).contiguous()
+            z_L = inner_model.L_init.to(device).unsqueeze(0).unsqueeze(0).expand(
+                batch_size, carry.z_L.shape[1], -1
+            ).contiguous()
+            current_tree_width = 1
+
+            # print(f"[DEBUG] Initial z_H mean: {z_H.abs().mean().item():.6f}, z_L mean: {z_L.abs().mean().item():.6f}")
+
+            # Run L-cycles with branching
+            for _L_step in range(inner_model.config.L_cycles):
+                expanded_input = inner_model._expand_input_for_tree(input_embeddings, current_tree_width)
+                expanded_z_H = inner_model._expand_input_for_tree(z_H, current_tree_width)
+                z_L = inner_model.L_level(z_L, expanded_z_H + expanded_input, **seq_info)
+
+                # Branch if needed
+                if _L_step < inner_model.config.tree_branching_steps:
+                    z_L = inner_model._branch_state(z_L, current_tree_width)
+                    current_tree_width *= 2
+
+            # print(f"[DEBUG] After L-cycles, z_L shape: {z_L.shape}, tree_width: {current_tree_width}")
+            # print(f"[DEBUG] z_L mean: {z_L.abs().mean().item():.6f}, has NaN: {torch.isnan(z_L).any().item()}")
+
+            # Reshape z_L to [batch_size, tree_width, seq_len, hidden_size]
+            z_L_branches = z_L.view(batch_size, current_tree_width, *z_L.shape[1:])
+
+            # Flatten for cosine similarity: [batch_size, tree_width, seq_len * hidden_size]
+            z_L_flat = z_L_branches.view(batch_size, current_tree_width, -1)
+            z_L_norm = F.normalize(z_L_flat, dim=-1)
+
+            # print(f"[DEBUG] z_L_norm has NaN: {torch.isnan(z_L_norm).any().item()}")
+
+            # 1. Compute z_L branch-to-branch cosine similarity [batch_size, tree_width, tree_width]
+            z_L_cosine = torch.bmm(z_L_norm, z_L_norm.transpose(1, 2))
+
+            # print(f"[DEBUG] z_L_cosine has NaN: {torch.isnan(z_L_cosine).any().item()}")
+
+            # Get off-diagonal elements (exclude self-similarity)
+            for b in range(batch_size):
+                mask = ~torch.eye(current_tree_width, dtype=torch.bool, device=device)
+                off_diag = z_L_cosine[b][mask]
+                all_z_L_sims.extend(off_diag.float().cpu().numpy())
+
+            # 2. Compute z_L to z_H cosine similarity
+            # Merge z_L and update z_H
+            z_L_merged = inner_model._merge_tree(z_L, current_tree_width, batch_size)
+            z_H_new = inner_model.L_level(z_H, z_L_merged, **seq_info)
+
+            # print(f"[DEBUG] z_H_new mean: {z_H_new.abs().mean().item():.6f}, has NaN: {torch.isnan(z_H_new).any().item()}")
+
+            # Flatten z_H: [batch_size, 1, seq_len * hidden_size]
+            z_H_flat = z_H_new.view(batch_size, 1, -1)
+            z_H_norm = F.normalize(z_H_flat, dim=-1)
+
+            # Compute similarity: [batch_size, tree_width, 1]
+            z_L_z_H_cosine = torch.bmm(z_L_norm, z_H_norm.transpose(1, 2)).squeeze(-1)
+
+            # print(f"[DEBUG] z_L_z_H_cosine has NaN: {torch.isnan(z_L_z_H_cosine).any().item()}")
+
+            # Collect all values
+            all_z_L_z_H_sims.extend(z_L_z_H_cosine.flatten().float().cpu().numpy())
+
+            sample_count += 1
+
+    # Compute statistics
+    # print(f"[DEBUG] Collected {len(all_z_L_sims)} z_L similarities, {len(all_z_L_z_H_sims)} z_L-z_H similarities")
+
+    all_z_L_sims = np.array(all_z_L_sims)
+    all_z_L_z_H_sims = np.array(all_z_L_z_H_sims)
+
+    # print(f"[DEBUG] z_L_sims array: mean={all_z_L_sims.mean():.4f}, std={all_z_L_sims.std():.4f}, has NaN: {np.isnan(all_z_L_sims).any()}")
+    # print(f"[DEBUG] z_L_z_H_sims array: mean={all_z_L_z_H_sims.mean():.4f}, std={all_z_L_z_H_sims.std():.4f}, has NaN: {np.isnan(all_z_L_z_H_sims).any()}")
+
+    return {
+        'z_L_branch_similarity_mean': float(all_z_L_sims.mean()) if len(all_z_L_sims) > 0 else 0.0,
+        'z_L_branch_similarity_std': float(all_z_L_sims.std()) if len(all_z_L_sims) > 0 else 0.0,
+        'z_L_z_H_similarity_mean': float(all_z_L_z_H_sims.mean()) if len(all_z_L_z_H_sims) > 0 else 0.0,
+        'z_L_z_H_similarity_std': float(all_z_L_z_H_sims.std()) if len(all_z_L_z_H_sims) > 0 else 0.0,
+    }
+
+
 def evaluate(
     config: PretrainConfig,
     train_state: TrainState,
@@ -453,7 +686,7 @@ def evaluate(
                 elapsed_time = time.time() - eval_start_time
                 elapsed_min = int(elapsed_time // 60)
                 elapsed_sec = int(elapsed_time % 60)
-                print(f"[EVAL] Batch {processed_batches:,}/{estimated_batches:,} ({progress_pct:.1f}%) - Elapsed: {elapsed_min}m {elapsed_sec}s")
+                # print(f"[EVAL] Batch {processed_batches:,}/{estimated_batches:,} ({progress_pct:.1f}%) - Elapsed: {elapsed_min}m {elapsed_sec}s")
             
             # To device
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -566,6 +799,51 @@ def evaluate(
                 
         # if rank == 0:
         #     print("All evaluators completed!")
+
+    # Add ToTRM branch diversity metrics
+    if rank == 0 and reduced_metrics is not None:
+        # Find actual model (handle compiled and wrapper cases)
+        actual_model = train_state.model
+        if hasattr(actual_model, '_orig_mod'):
+            actual_model = actual_model._orig_mod  # Unwrap compiled
+        if hasattr(actual_model, 'model'):
+            actual_model = actual_model.model  # Unwrap model wrapper
+
+        # Check if model is ToTRM
+        is_totrm = (hasattr(actual_model, 'inner') and
+                    hasattr(actual_model.inner, 'branch_embeddings') and
+                    hasattr(actual_model.inner, 'config') and
+                    hasattr(actual_model.inner.config, 'tree_branching_steps'))
+
+        # print(f"[DEBUG] Model structure: {type(train_state.model).__name__} -> {type(actual_model).__name__}")
+        # print(f"[DEBUG] Is ToTRM model: {is_totrm}")
+
+        if is_totrm:
+            try:
+                # Create fresh eval loader for branch metrics computation
+                fresh_eval_loader, _ = create_dataloader(
+                    config,
+                    "test",
+                    test_set_mode=True,
+                    epochs_per_iter=1,
+                    global_batch_size=config.global_batch_size,
+                    rank=rank,
+                    world_size=world_size
+                )
+
+                # print(f"[DEBUG] Computing ToTRM branch metrics...")
+                branch_metrics = compute_totrm_branch_metrics(
+                    actual_model,
+                    fresh_eval_loader,
+                    device,
+                    num_samples=5
+                )
+                # print(f"[DEBUG] Branch metrics computed: {branch_metrics}")
+                reduced_metrics['totrm_branch'] = branch_metrics
+            except Exception as e:
+                import traceback
+                print(f"[WARNING] Failed to compute ToTRM branch metrics: {e}")
+                print(f"[WARNING] Traceback:\n{traceback.format_exc()}")
 
     if rank == 0:
         total_eval_time = time.time() - eval_start_time
@@ -755,8 +1033,8 @@ def launch(hydra_config: DictConfig):
                 cpu_group=CPU_PROCESS_GROUP,
                 device=DEVICE)
 
-            if RANK == 0 and metrics is not None:
-                # print(f"Eval metrics at step {train_state.step}: {metrics}")
+            if RANK == 0 and eval_metrics is not None:
+                # print(f"Eval metrics at step {train_state.step}: {eval_metrics}")
                 flatten_metrics = {}
                 for key, val in eval_metrics.items():
                     if isinstance(val, dict):
@@ -764,6 +1042,10 @@ def launch(hydra_config: DictConfig):
                             flatten_metrics[f"eval/{sub_key}"] = sub_val
                     else:
                         flatten_metrics[f"eval/{key}"] = val
+
+                # print(f"[DEBUG] Flattened metrics keys: {list(flatten_metrics.keys())}")
+                # print(f"[DEBUG] wandb.run: {wandb.run}")
+
                 if wandb.run is not None:
                     wandb.log(flatten_metrics, step=train_state.step, commit=True)
                 latest_eval_metrics = flatten_metrics

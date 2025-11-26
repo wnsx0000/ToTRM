@@ -77,6 +77,7 @@ class ToTRM_Config(BaseModel):
     mlp_t: bool = False
     puzzle_emb_len: int = 16
     no_ACT_continue: bool = True
+    branch_norm_factor: Optional[float] = None  # If None, use adaptive: 0.5 * sqrt(hidden_size/64)
 
 
 class ToTRM_Block(nn.Module):
@@ -198,6 +199,14 @@ class ToTRM_Inner(nn.Module):
             torch.randn(max_tree_width, self.config.hidden_size, dtype=self.forward_dtype) * 0.02
         )
 
+        # Compute adaptive branch norm factor
+        # If not specified, scale with sqrt(hidden_size) to maintain relative impact
+        # Base calibration: hidden_size=64 → factor=0.5 (verified on 4x4 Sudoku)
+        if self.config.branch_norm_factor is None:
+            self.branch_norm_factor = 0.5 * math.sqrt(self.config.hidden_size / 64.0)
+        else:
+            self.branch_norm_factor = self.config.branch_norm_factor
+
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
         self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
@@ -250,10 +259,13 @@ class ToTRM_Inner(nn.Module):
         # branch_pattern = torch.randint(0, max_tree_width, (new_tree_width,), device=z.device)
         branch_indices = branch_pattern.repeat(batch_size)
         
+        # # Adaptive scaling based on z_branched norm
+        # z_norm = z_branched.norm(dim=-1, keepdim=True).mean()
+        # branch_norm_factor = 0.05 * z_norm  # z_L의 5% 이 scale도 조작 가능
+
         # Get branch embeddings: [B*W*2, D]
-        # branch_embs = self.branch_embeddings[branch_indices]
-        branch_norm_factor = 0.5
-        branch_embs = F.normalize(self.branch_embeddings[branch_indices], dim=-1) * branch_norm_factor
+        # Normalize and scale with adaptive factor (computed in __init__)
+        branch_embs = F.normalize(self.branch_embeddings[branch_indices], dim=-1) * self.branch_norm_factor
 
         # # DEBUG: Print shapes before and after unsqueeze
         # if current_tree_width == 1:  # Only print on first branching

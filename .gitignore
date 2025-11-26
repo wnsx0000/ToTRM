@@ -7,3 +7,4 @@ official_trm.egg-info
 outputs
 nohup_logs
 nohup.out
+pytorch_test.py
