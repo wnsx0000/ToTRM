@@ -77,8 +77,7 @@ class ToTRM_Config(BaseModel):
     mlp_t: bool = False
     puzzle_emb_len: int = 16
     no_ACT_continue: bool = True
-    branch_norm_factor: Optional[float] = None  # If None, use adaptive: 0.5 * sqrt(hidden_size/64)
-    adaptive_branch_scale: Optional[float] = None  # If set (e.g., 0.2), scale branch_emb as fraction of z norm
+    adaptive_branch_scale: Optional[float] = 1.0  # If set (e.g., 0.2), scale branch_emb as fraction of z norm
     diversity_weight: float = 0.1  # Weight for diversity loss (0 to disable)
     diversity_margin: float = 0.0  # Hinge margin for diversity loss (0 = no hinge, 0.85 = recommended)
 
@@ -198,17 +197,32 @@ class ToTRM_Inner(nn.Module):
         # Branch embeddings to differentiate branches at each level
         # Each branch gets a unique embedding based on its position in the tree
         max_tree_width = 2 ** self.config.tree_branching_steps
+
+        # Initialize with Xavier-like scaling for proper variance across hidden_size
+        # Xavier ensures variance is preserved through layers: Var(output) = Var(input)
+        # Standard: sqrt(6 / (fan_in + fan_out)), here simplified to sqrt(2/hidden_size)
+        # For hidden_size=512: std ≈ 0.063 (vs old 0.02, 3x larger)
+        # This ensures branches start with meaningful differentiation
+        branch_emb_std = math.sqrt(2.0 / self.config.hidden_size)
         self.branch_embeddings = nn.Parameter(
-            torch.randn(max_tree_width, self.config.hidden_size, dtype=self.forward_dtype) * 0.02
+            torch.randn(max_tree_width, self.config.hidden_size, dtype=self.forward_dtype) * branch_emb_std
         )
 
-        # Compute adaptive branch norm factor
-        # If not specified, scale with sqrt(hidden_size) to maintain relative impact
-        # Base calibration: hidden_size=64 → factor=0.5 (verified on 4x4 Sudoku)
-        if self.config.branch_norm_factor is None:
-            self.branch_norm_factor = 0.5 * math.sqrt(self.config.hidden_size / 64.0)
-        else:
-            self.branch_norm_factor = self.config.branch_norm_factor
+        # FiLM (Feature-wise Linear Modulation) layer for branching
+        # Projects branch embeddings to γ (scale) and β (shift) parameters
+        # Uses standard CastedLinear initialization (truncated normal with std=1/√d_in, bias=0)
+        # which gives std ≈ 0.044 for hidden_size=512, mean ≈ 0 for both γ and β
+        #
+        # This initialization works correctly because the apply_branching method (line 288-293):
+        # - Transforms γ: γ_final = 1.0 + adaptive_scale * (γ - γ.mean())
+        #   Initial: γ ≈ 0 → γ_final ≈ 1.0 (multiplicative identity) ✓
+        # - Transforms β: β_final = (adaptive_scale * z_magnitude) * β
+        #   Initial: β ≈ 0 → β_final ≈ 0 (additive identity) ✓
+        self.branch_to_film = CastedLinear(
+            self.config.hidden_size,
+            self.config.hidden_size * 2,  # γ and β
+            bias=True
+        )
 
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
@@ -236,11 +250,14 @@ class ToTRM_Inner(nn.Module):
         return self.embed_scale * embedding
 
     def _branch_state(self, z: torch.Tensor, current_tree_width: int) -> torch.Tensor:
-        """Branch each state into 2 copies with distinct embeddings.
-        
-        Each branch gets a unique learnable embedding to differentiate it from its sibling.
-        This allows the model to explore different reasoning paths.
-        
+        """Branch each state into 2 copies with FiLM (Feature-wise Linear Modulation).
+
+        Each branch applies unique γ (scale) and β (shift) parameters derived from
+        learnable branch embeddings. This allows richer differentiation between branches
+        compared to simple additive embeddings.
+
+        FiLM formula: output = γ ⊙ z + β
+
         Args:
             z: [batch_size * current_width, seq_len, hidden_size]
             current_tree_width: Current width before branching
@@ -250,52 +267,42 @@ class ToTRM_Inner(nn.Module):
         # Duplicate each state
         z_branched = z.repeat_interleave(2, dim=0)
         # [B*W*2, L, D]
-        
-        # Add unique branch embeddings to differentiate the branches
-        # For each pair of branches, add different embeddings
+
+        # Generate FiLM parameters from branch embeddings
         batch_size = z.shape[0] // current_tree_width
         new_tree_width = current_tree_width * 2
-        
+
         # Create branch indices: [0, 1, 0, 1, 0, 1, ...] for the entire batch
         branch_pattern = torch.arange(new_tree_width, device=z.device)
-        # max_tree_width = 2 ** self.config.tree_branching_steps
-        # branch_pattern = torch.randint(0, max_tree_width, (new_tree_width,), device=z.device)
         branch_indices = branch_pattern.repeat(batch_size)
 
-        # Compute branch embedding scale
-        if self.config.adaptive_branch_scale is not None:
-            # Adaptive scaling: scale as a fraction of current z magnitude
-            # This ensures branch embeddings are always relative to z's current scale
-            z_magnitude = z_branched.norm(dim=-1, keepdim=True).mean()  # Mean L2 norm across all positions
-            branch_scale = self.config.adaptive_branch_scale * z_magnitude
-        else:
-            # Fixed scaling: use pre-computed factor from __init__
-            branch_scale = self.branch_norm_factor
-
         # Get branch embeddings: [B*W*2, D]
-        # Normalize to unit vectors, then scale
-        branch_embs = F.normalize(self.branch_embeddings[branch_indices], dim=-1) * branch_scale
+        branch_embs = self.branch_embeddings[branch_indices]
 
-        # # DEBUG: Print shapes before and after unsqueeze
-        # if current_tree_width == 1:  # Only print on first branching
-        #     print(f"[DEBUG BRANCHING]")
-        #     print(f"  z_branched.shape (before adding) = {z_branched.shape}")
-        #     print(f"  branch_embs.shape = {branch_embs.shape}")
-        #     branch_embs_unsqueezed = branch_embs.unsqueeze(1)
-        #     print(f"  branch_embs.unsqueeze(1).shape = {branch_embs_unsqueezed.shape}")
-        #     print(f"  Broadcasting: [{z_branched.shape[0]}, {z_branched.shape[1]}, {z_branched.shape[2]}]")
-        #     print(f"              + [{branch_embs_unsqueezed.shape[0]}, {branch_embs_unsqueezed.shape[1]}, {branch_embs_unsqueezed.shape[2]}]")
-        #     print(f"  -> Same branch_emb vector added to ALL {z_branched.shape[1]} positions")
+        # Project to FiLM parameters: [B*W*2, D*2]
+        film_params = self.branch_to_film(branch_embs)
 
-        # # branch embeddings 이전에 먼저 normalize
-        # z_branched_norm = F.layer_norm(z_branched, (z_branched.shape[-1],))
+        # Split into γ (scale) and β (shift): each [B*W*2, D]
+        gamma, beta = film_params.chunk(2, dim=-1)
 
-        # 더하기
-        # z_branched = z_branched_norm + branch_embs.unsqueeze(1)
-        z_branched = z_branched + branch_embs.unsqueeze(1)
+        # Adaptive scaling: scale FiLM parameters appropriately
+        z_magnitude = z_branched.norm(dim=-1, keepdim=True).mean()  # Mean L2 norm across all positions
 
-        # # branch embeddings 더한 후에 normalize
-        # z_branched = F.layer_norm(z_branched, (z_branched.shape[-1],))
+        # Gamma (scale) is a RATIO: should NOT depend on z_magnitude
+        # gamma = 1.0 means "no change", gamma = 1.2 means "20% increase"
+        # This ratio should be the same regardless of whether z is large or small
+        # INITIALIZATION: γ starts near 0 (from branch_to_film), after centering → γ_final ≈ 1.0
+        gamma = 1.0 + self.config.adaptive_branch_scale * (gamma - gamma.mean(dim=-1, keepdim=True))
+
+        # Beta (shift) is ADDITIVE: SHOULD scale with z_magnitude
+        # If z~100 and we want 20% change, we need beta~20 (not beta~0.2)
+        # So beta must be proportional to z_magnitude
+        # INITIALIZATION: β starts near 0 (from branch_to_film) → β_final ≈ 0
+        beta = (self.config.adaptive_branch_scale * z_magnitude) * beta
+
+        # Apply FiLM: z_out = γ ⊙ z + β
+        # Broadcast: [B*W*2, L, D] = [B*W*2, 1, D] ⊙ [B*W*2, L, D] + [B*W*2, 1, D]
+        z_branched = gamma.unsqueeze(1) * z_branched + beta.unsqueeze(1)
 
         return z_branched
 
