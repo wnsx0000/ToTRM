@@ -55,6 +55,90 @@ def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
     return F.cross_entropy(logits.to(torch.float32).view(-1, logits.shape[-1]), labels.to(torch.long).view(-1), ignore_index=ignore_index, reduction="none").view(labels.shape)
 
 
+def diversity_loss(z_branches: torch.Tensor, margin: float = 0.0, reduction: str = "sum") -> torch.Tensor:
+    """
+    Encourage diversity between tree-of-thought branches using squared hinge loss.
+
+    Uses per-sample reduction (mean over branch pairs within each sample, then sum/mean over batch)
+    to ensure each problem in the batch gets appropriate and independent diversity penalties.
+
+    Hinge variant (margin > 0):
+        - Only penalizes when similarity exceeds margin
+        - Allows model to focus on task performance once diversity is sufficient
+        - loss = max(0, cosine_sim - margin)²
+
+    Standard variant (margin = 0):
+        - Always penalizes similarity
+        - loss = cosine_sim²
+
+    Args:
+        z_branches: Tensor of shape [batch_size, tree_width, seq_len, hidden_size]
+                   representing the latent states for each branch in the tree.
+        margin: Target maximum cosine similarity (e.g., 0.85). When margin > 0, only similarities
+                above this threshold are penalized (hinge loss). Default 0.0 (no hinge).
+        reduction: "sum" (default, consistent with lm_loss) or "mean"
+
+    Returns:
+        diversity_loss: Scalar tensor. Lower values indicate more diverse branches.
+
+        Typical values with margin=0.85:
+        - similarity=0.97 → violation=0.12 → loss≈0.014 per sample
+        - similarity=0.80 → violation=0.0  → loss=0 (no penalty)
+
+    Example:
+        >>> z_branches = torch.randn(8, 4, 32, 512)  # batch=8, 4 branches, seq=32, hidden=512
+        >>> loss = diversity_loss(z_branches, margin=0.85)
+        >>> # If branches are collapsing (sim>0.85), loss > 0
+        >>> # If branches are diverse enough (sim<0.85), loss = 0
+    """
+    batch_size, tree_width, seq_len, hidden_size = z_branches.shape
+
+    # Flatten seq_len and hidden_size dimensions for each branch
+    # Shape: [batch_size, tree_width, seq_len * hidden_size]
+    z_flat = z_branches.flatten(2)
+
+    # Normalize each branch to unit vectors for cosine similarity computation
+    # Shape: [batch_size, tree_width, seq_len * hidden_size]
+    z_norm = F.normalize(z_flat, dim=-1)
+
+    # Compute pairwise cosine similarity matrix via batch matrix multiplication
+    # Shape: [batch_size, tree_width, tree_width]
+    sim_matrix = torch.bmm(z_norm, z_norm.transpose(1, 2))
+
+    # Create mask to exclude diagonal (self-similarity = 1.0)
+    # We only care about similarity between different branches
+    mask = ~torch.eye(tree_width, dtype=torch.bool, device=z_branches.device)
+    mask = mask.unsqueeze(0).expand(batch_size, -1, -1)
+
+    # Extract off-diagonal elements (inter-branch similarities)
+    # Shape: [batch_size, tree_width * (tree_width - 1)]
+    off_diag_sim = sim_matrix[mask].view(batch_size, -1)
+
+    # Apply hinge if margin > 0: only penalize violations
+    if margin > 0:
+        # Hinge: max(0, similarity - margin)
+        violations = torch.clamp(off_diag_sim - margin, min=0.0)
+        similarities = violations
+    else:
+        # No hinge: penalize all similarity
+        similarities = off_diag_sim
+
+    # Per-sample loss: mean over pairs WITHIN each sample
+    # This ensures each problem gets independent diversity penalty
+    # Shape: [batch_size]
+    per_sample_loss = similarities.pow(2).mean(dim=1)
+
+    # Aggregate over batch (consistent with lm_loss, q_halt_loss)
+    if reduction == "sum":
+        loss = per_sample_loss.sum()
+    elif reduction == "mean":
+        loss = per_sample_loss.mean()
+    else:
+        raise ValueError(f"Unknown reduction: {reduction}")
+
+    return loss
+
+
 class ACTLossHead(nn.Module):
     def __init__(self, model: nn.Module, loss_type: str):
         super().__init__()
@@ -115,9 +199,32 @@ class ACTLossHead(nn.Module):
             q_continue_loss = F.binary_cross_entropy_with_logits(outputs["q_continue_logits"], outputs["target_q_continue"], reduction="sum")
 
             metrics["q_continue_loss"] = q_continue_loss.detach()
+
+        # Diversity loss (ToTRM only)
+        div_loss = 0
+        if "z_L_branches" in outputs:
+            # Get diversity hyperparameters from model config
+            diversity_weight = getattr(self.model.config, 'diversity_weight', 0.1)
+            diversity_margin = getattr(self.model.config, 'diversity_margin', 0.0)
+
+            if diversity_weight > 0:
+                # Compute diversity loss with hinge (if margin > 0)
+                # Uses per-sample reduction: mean over pairs, sum over batch
+                div_loss = diversity_loss(
+                    outputs["z_L_branches"],
+                    margin=diversity_margin,
+                    reduction="sum"
+                )
+                # Scale by diversity_weight
+                div_loss = diversity_weight * div_loss
+                metrics["diversity_loss"] = div_loss.detach()
+
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
+        # Total loss: lm_loss + q_losses + diversity_loss
+        total_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + div_loss
+
         # print(f"checking {metrics=}")
-        return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
+        return new_carry, total_loss, metrics, detached_outputs, new_carry.halted.all()
 

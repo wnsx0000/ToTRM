@@ -78,6 +78,9 @@ class ToTRM_Config(BaseModel):
     puzzle_emb_len: int = 16
     no_ACT_continue: bool = True
     branch_norm_factor: Optional[float] = None  # If None, use adaptive: 0.5 * sqrt(hidden_size/64)
+    adaptive_branch_scale: Optional[float] = None  # If set (e.g., 0.2), scale branch_emb as fraction of z norm
+    diversity_weight: float = 0.1  # Weight for diversity loss (0 to disable)
+    diversity_margin: float = 0.0  # Hinge margin for diversity loss (0 = no hinge, 0.85 = recommended)
 
 
 class ToTRM_Block(nn.Module):
@@ -258,14 +261,20 @@ class ToTRM_Inner(nn.Module):
         # max_tree_width = 2 ** self.config.tree_branching_steps
         # branch_pattern = torch.randint(0, max_tree_width, (new_tree_width,), device=z.device)
         branch_indices = branch_pattern.repeat(batch_size)
-        
-        # # Adaptive scaling based on z_branched norm
-        # z_norm = z_branched.norm(dim=-1, keepdim=True).mean()
-        # branch_norm_factor = 0.05 * z_norm  # z_L의 5% 이 scale도 조작 가능
+
+        # Compute branch embedding scale
+        if self.config.adaptive_branch_scale is not None:
+            # Adaptive scaling: scale as a fraction of current z magnitude
+            # This ensures branch embeddings are always relative to z's current scale
+            z_magnitude = z_branched.norm(dim=-1, keepdim=True).mean()  # Mean L2 norm across all positions
+            branch_scale = self.config.adaptive_branch_scale * z_magnitude
+        else:
+            # Fixed scaling: use pre-computed factor from __init__
+            branch_scale = self.branch_norm_factor
 
         # Get branch embeddings: [B*W*2, D]
-        # Normalize and scale with adaptive factor (computed in __init__)
-        branch_embs = F.normalize(self.branch_embeddings[branch_indices], dim=-1) * self.branch_norm_factor
+        # Normalize to unit vectors, then scale
+        branch_embs = F.normalize(self.branch_embeddings[branch_indices], dim=-1) * branch_scale
 
         # # DEBUG: Print shapes before and after unsqueeze
         # if current_tree_width == 1:  # Only print on first branching
@@ -473,6 +482,10 @@ class ToTRM_Inner(nn.Module):
                 z_L = self._branch_state(z_L, current_tree_width)
                 current_tree_width *= 2
         
+        # Capture z_L branches for diversity loss (before merging)
+        # Reshape from [batch*tree_width, seq_len, hidden] to [batch, tree_width, seq_len, hidden]
+        z_L_branches = z_L.view(original_batch_size, current_tree_width, *z_L.shape[1:])
+
         # Final merge
         z_L_merged = self._merge_tree(z_L, current_tree_width, original_batch_size)
         z_H = self.L_level(z_H, z_L_merged, **seq_info)
@@ -504,7 +517,7 @@ class ToTRM_Inner(nn.Module):
         # print(f"[DEBUG] q_logits.shape = {q_logits.shape}")
         # print(f"        Meaning: [batch_size, 2] (Q-values: [halt, continue])")
 
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
+        return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), z_L_branches
 
 
 class ToTRM(nn.Module):
@@ -536,12 +549,13 @@ class ToTRM(nn.Module):
         new_current_data = {k: torch.where(carry.halted.view((-1,) + (1,) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
         # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits), z_L_branches = self.inner(new_inner_carry, new_current_data)
 
         outputs = {
             "logits": logits,
             "q_halt_logits": q_halt_logits,
-            "q_continue_logits": q_continue_logits
+            "q_continue_logits": q_continue_logits,
+            "z_L_branches": z_L_branches  # For diversity loss
         }
 
         with torch.no_grad():
@@ -559,7 +573,7 @@ class ToTRM(nn.Module):
                 halted = halted & (new_steps >= min_halt_steps)
 
                 if not self.config.no_ACT_continue:
-                    _, _, (next_q_halt_logits, next_q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+                    _, _, (next_q_halt_logits, next_q_continue_logits), _ = self.inner(new_inner_carry, new_current_data)
                     outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
         return ToTRM_Carry(new_inner_carry, new_steps, halted, new_current_data), outputs

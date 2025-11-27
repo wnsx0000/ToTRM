@@ -35,13 +35,14 @@ uv run python pretrain.py \
     arch.halt_max_steps=16 \
     \
     arch.tree_branching_steps=3 \
-    arch.tree_merge_method=mean \
-    +arch.branch_norm_factor=0.1 \
+    arch.tree_merge_method=max \
+    +arch.adaptive_branch_scale=0.2 \
+    +arch.diversity_weight=1.0 \
+    +arch.diversity_margin=0.85 \
     \
     +entity="jhunforspeed-soongsil-univ" \
     +project_name="totrm-sudoku-extreme" \
-    +run_name="trm-to-totrm-freeze-3branch-scale0.1"
-
+    +run_name="trm-to-totrm-normscale0.2-maxmerge-diversityfixed-weight1.0-margin0.85"
 
 # Transfer Learning Configuration:
 # --------------------------------
