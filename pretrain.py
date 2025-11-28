@@ -520,6 +520,10 @@ def compute_totrm_branch_metrics(model, eval_loader, device, num_samples=5):
             - z_L_branch_similarity_std: std of cosine similarity between z_L branches
             - z_L_z_H_similarity_mean: mean cosine similarity between each z_L and final z_H
             - z_L_z_H_similarity_std: std of cosine similarity between each z_L and final z_H
+            - branch_parent_child_similarity_mean: mean similarity between parent and child after branching
+            - branch_parent_child_similarity_std: std of parent-child similarity
+            - branch_sibling_similarity_mean: mean similarity between sibling branches (after branching)
+            - branch_sibling_similarity_std: std of sibling similarity
     """
     # print(f"[DEBUG compute_totrm_branch_metrics] Model type: {type(model).__name__}")
     # print(f"[DEBUG compute_totrm_branch_metrics] Has inner: {hasattr(model, 'inner')}")
@@ -532,6 +536,8 @@ def compute_totrm_branch_metrics(model, eval_loader, device, num_samples=5):
 
     all_z_L_sims = []
     all_z_L_z_H_sims = []
+    all_branch_parent_child_sims = []  # Similarity between parent and child after branching
+    all_branch_sibling_sims = []  # Similarity between sibling branches
 
     with torch.no_grad():
         sample_count = 0
@@ -573,7 +579,36 @@ def compute_totrm_branch_metrics(model, eval_loader, device, num_samples=5):
 
                 # Branch if needed
                 if _L_step < inner_model.config.tree_branching_steps:
+                    # Save z_L before branching to measure branching effect
+                    z_L_before_branch = z_L.clone()
+
+                    # Apply branching
                     z_L = inner_model._branch_state(z_L, current_tree_width)
+
+                    # Measure branching effectiveness
+                    # Before: [B*W, L, D], After: [B*W*2, L, D]
+                    # Each before[i] becomes after[2*i] and after[2*i+1]
+                    z_L_before_flat = z_L_before_branch.flatten(1)  # [B*W, L*D]
+                    z_L_after_flat = z_L.flatten(1)  # [B*W*2, L*D]
+
+                    z_L_before_norm = F.normalize(z_L_before_flat, dim=-1)
+                    z_L_after_norm = F.normalize(z_L_after_flat, dim=-1)
+
+                    # Parent-child similarity: before[i] vs after[2*i] and after[2*i+1]
+                    num_parents = z_L_before_norm.shape[0]
+                    for i in range(num_parents):
+                        parent = z_L_before_norm[i:i+1]  # [1, L*D]
+                        child1 = z_L_after_norm[2*i:2*i+1]  # [1, L*D]
+                        child2 = z_L_after_norm[2*i+1:2*i+2]  # [1, L*D]
+
+                        sim_parent_child1 = (parent * child1).sum().item()
+                        sim_parent_child2 = (parent * child2).sum().item()
+                        all_branch_parent_child_sims.extend([sim_parent_child1, sim_parent_child2])
+
+                        # Sibling similarity
+                        sim_siblings = (child1 * child2).sum().item()
+                        all_branch_sibling_sims.append(sim_siblings)
+
                     current_tree_width *= 2
 
             # print(f"[DEBUG] After L-cycles, z_L shape: {z_L.shape}, tree_width: {current_tree_width}")
@@ -625,6 +660,8 @@ def compute_totrm_branch_metrics(model, eval_loader, device, num_samples=5):
 
     all_z_L_sims = np.array(all_z_L_sims)
     all_z_L_z_H_sims = np.array(all_z_L_z_H_sims)
+    all_branch_parent_child_sims = np.array(all_branch_parent_child_sims)
+    all_branch_sibling_sims = np.array(all_branch_sibling_sims)
 
     # print(f"[DEBUG] z_L_sims array: mean={all_z_L_sims.mean():.4f}, std={all_z_L_sims.std():.4f}, has NaN: {np.isnan(all_z_L_sims).any()}")
     # print(f"[DEBUG] z_L_z_H_sims array: mean={all_z_L_z_H_sims.mean():.4f}, std={all_z_L_z_H_sims.std():.4f}, has NaN: {np.isnan(all_z_L_z_H_sims).any()}")
@@ -634,6 +671,10 @@ def compute_totrm_branch_metrics(model, eval_loader, device, num_samples=5):
         'z_L_branch_similarity_std': float(all_z_L_sims.std()) if len(all_z_L_sims) > 0 else 0.0,
         'z_L_z_H_similarity_mean': float(all_z_L_z_H_sims.mean()) if len(all_z_L_z_H_sims) > 0 else 0.0,
         'z_L_z_H_similarity_std': float(all_z_L_z_H_sims.std()) if len(all_z_L_z_H_sims) > 0 else 0.0,
+        'branch_parent_child_similarity_mean': float(all_branch_parent_child_sims.mean()) if len(all_branch_parent_child_sims) > 0 else 0.0,
+        'branch_parent_child_similarity_std': float(all_branch_parent_child_sims.std()) if len(all_branch_parent_child_sims) > 0 else 0.0,
+        'branch_sibling_similarity_mean': float(all_branch_sibling_sims.mean()) if len(all_branch_sibling_sims) > 0 else 0.0,
+        'branch_sibling_similarity_std': float(all_branch_sibling_sims.std()) if len(all_branch_sibling_sims) > 0 else 0.0,
     }
 
 
