@@ -1,6 +1,6 @@
 #!/bin/sh
 
-DISABLE_COMPILE=1 uv run python pretrain.py \
+uv run python pretrain.py \
     arch=totrm \
     data_paths="[data/sudoku4x4]" \
     arch.halt_exploration_prob=0.0 \
@@ -27,3 +27,8 @@ DISABLE_COMPILE=1 uv run python pretrain.py \
     eval_interval=100 \
     +entity="jhunforspeed-soongsil-univ" \
     +project_name="totrm-sudoku4x4" \
+    # \
+    # arch.tree_merge_method=learned_weighted \
+    # +arch.adaptive_branch_scale=1.0 \
+    # +arch.diversity_weight=10.0 \
+    # +arch.diversity_margin=0.85 \

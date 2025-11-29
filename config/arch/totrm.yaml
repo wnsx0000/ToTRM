@@ -27,4 +27,4 @@ no_ACT_continue: True
 
 # ToTRM specific parameters
 tree_branching_steps: 5  # Branch on first 5 out of 6 L_cycles (n-1 where n=6)
-tree_merge_method: mean  # Options: mean, max, learned_weighted
+tree_merge_method: mean  # Options: mean, max, learned_weighted, geometric_mean, gated_product, hierarchical_attention

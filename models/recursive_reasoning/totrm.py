@@ -193,6 +193,25 @@ class ToTRM_Inner(nn.Module):
             self.product_gate = nn.Parameter(
                 torch.tensor(-2.0, dtype=self.forward_dtype)
             )
+        elif self.config.tree_merge_method == "hierarchical_attention":
+            # Two-level attention-based merge:
+            # Level 1: Token-level attention (which tokens are important clues?)
+            # Level 2: Branch-level attention (which reasoning path is more logical?)
+
+            # Token query: evaluates importance of each token (focuses on filled cells vs empty)
+            self.token_query = nn.Parameter(torch.empty(1, 1, self.config.hidden_size, dtype=self.forward_dtype))
+
+            # Branch query: evaluates quality of each branch's reasoning summary
+            self.branch_query = nn.Parameter(torch.empty(1, 1, self.config.hidden_size, dtype=self.forward_dtype))
+
+            # Initialize with small std for near-uniform attention at start
+            # Scaled by hidden_size to maintain consistent behavior across model sizes
+            # Base std=0.02 chosen to match Transformer attention query initialization (BERT/GPT)
+            # Scaling: larger models (more dimensions) → smaller std for stability
+            init_std = 0.02 / math.sqrt(self.config.hidden_size / 512.0)
+            with torch.no_grad():
+                self.token_query.normal_(mean=0.0, std=init_std)
+                self.branch_query.normal_(mean=0.0, std=init_std)
         
         # Branch embeddings to differentiate branches at each level
         # Each branch gets a unique embedding based on its position in the tree
@@ -313,6 +332,7 @@ class ToTRM_Inner(nn.Module):
         - mean: Simple average (all branches equally weighted)
         - max: Take max activation (keeps strongest signal)
         - learned_weighted: Learn importance weights for each branch position
+        - hierarchical_attention: Two-level attention-based merge (token → branch)
 
         Args:
             z: [batch_size * tree_width, seq_len, hidden_size]
@@ -391,6 +411,55 @@ class ToTRM_Inner(nn.Module):
 
             # Interpolate: α * geom_mean + (1-α) * arith_mean
             z = alpha * geom_mean + (1 - alpha) * arith_mean
+        elif self.config.tree_merge_method == "hierarchical_attention":
+            # Two-level attention-based merge for content-based branch selection
+            # Pro: Content-based (not position-based), learns what makes a good reasoning path
+            # Pro: Two-level abstraction matches puzzle-solving (clues → reasoning)
+            # Con: More parameters than simple methods (but still efficient)
+
+            # ==========================================
+            # Step 1: Token-level Attention (Pooling)
+            # ==========================================
+            # Learn which tokens are important clues within each branch
+            # Query automatically learns to focus on informative tokens (e.g., filled cells vs empty)
+            # through training, without explicit masking
+
+            # Compute attention scores: how relevant is each token to solving the puzzle?
+            # [1, 1, D] * [B, W, L, D] -> [B, W, L]
+            token_scores = torch.einsum('d,bwld->bwl', self.token_query.squeeze(), z)
+            token_scores = token_scores / math.sqrt(self.config.hidden_size)
+
+            # Normalize to get importance weights
+            token_weights = F.softmax(token_scores, dim=2).unsqueeze(-1)  # [B, W, L, 1]
+
+            # Weighted sum: create branch summary by focusing on important tokens
+            # This pools each branch's reasoning into a single representative vector
+            z_branch = (z * token_weights).sum(dim=2)  # [B, W, D]
+
+            # ==========================================
+            # Step 2: Branch-level Attention (Selection)
+            # ==========================================
+            # Learn which branch has the most logical/consistent reasoning
+
+            # Compute branch quality scores
+            # [1, 1, D] * [B, W, D] -> [B, W]
+            branch_scores = torch.einsum('d,bwd->bw', self.branch_query.squeeze(), z_branch)
+            branch_scores = branch_scores / math.sqrt(self.config.hidden_size)
+
+            # Normalize to get branch importance weights
+            branch_weights = F.softmax(branch_scores, dim=1)  # [B, W]
+
+            # ==========================================
+            # Step 3: Final Merge
+            # ==========================================
+            # Apply branch weights to original z (not just summaries)
+            # This preserves full token-level information from best branches
+
+            # Reshape for broadcasting: [B, W] -> [B, W, 1, 1]
+            final_weights = branch_weights.view(original_batch_size, tree_width, 1, 1)
+
+            # Weighted merge: branches with better reasoning contribute more
+            z = (z * final_weights).sum(dim=1)  # [B, L, D]
         else:
             raise ValueError(f"Unknown merge method: {self.config.tree_merge_method}")
 
